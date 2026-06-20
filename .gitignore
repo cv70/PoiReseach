@@ -1,0 +1,17 @@
+# Go binaries
+poi-server
+poi-server.exe
+*.test
+*.out
+
+# Go workspace
+go.work.sum
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
