@@ -14,6 +14,8 @@ type Place struct {
 	Tags        map[string]string `json:"tags,omitempty"`
 	BoundingBox []string          `json:"boundingbox,omitempty"`
 	Icon        string            `json:"icon,omitempty"`
+	Source      string            `json:"source,omitempty"`   // 数据来源: nominatim / photon / wikidata ...
+	RawID       string            `json:"raw_id,omitempty"`  // 该源的原生 ID
 }
 
 type PlaceDetail struct {

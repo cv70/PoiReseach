@@ -9,23 +9,33 @@ import (
 	"sync"
 
 	"poi-research/internal/model"
-	"poi-research/internal/nominatim"
 	"poi-research/internal/overpass"
+	"poi-research/internal/provider"
 	"poi-research/internal/weather"
 	"poi-research/internal/wikipedia"
 )
 
+// ResearchService 聚合多个搜索源并产出旅游攻略风格的结果。
 type ResearchService struct {
-	nominatim *nominatim.Client
+	providers []provider.PlaceProvider
 	overpass  *overpass.Client
 	wiki      *wikipedia.Client
 	weather   *weather.Client
 	userAgent string
 }
 
+// NewResearchService 用内置的多个数据源构造服务。
+// 顺序就是"优先度"，importance 相同时按顺序取靠前的。
 func NewResearchService(userAgent string) *ResearchService {
+	if userAgent == "" {
+		userAgent = "poi-research/2.0 (+local)"
+	}
 	return &ResearchService{
-		nominatim: nominatim.NewClient(userAgent),
+		providers: []provider.PlaceProvider{
+			provider.NewNominatimProvider(userAgent),
+			provider.NewPhotonProvider(userAgent, "zh"),
+			provider.NewWikidataProvider(userAgent, "zh"),
+		},
 		overpass:  overpass.NewClient(userAgent),
 		wiki:      wikipedia.NewClient(userAgent),
 		weather:   weather.NewClient(userAgent),
@@ -33,25 +43,52 @@ func NewResearchService(userAgent string) *ResearchService {
 	}
 }
 
+// NewResearchServiceWithProviders 允许外部传入自定义 provider 列表（测试用 / 覆盖默认）。
+func NewResearchServiceWithProviders(userAgent string, providers []provider.PlaceProvider) *ResearchService {
+	return &ResearchService{
+		providers: providers,
+		overpass:  overpass.NewClient(userAgent),
+		wiki:      wikipedia.NewClient(userAgent),
+		weather:   weather.NewClient(userAgent),
+		userAgent: userAgent,
+	}
+}
+
+// Providers 返回当前已注册的 provider 名，供调试端点打印。
+func (s *ResearchService) Providers() []string {
+	out := make([]string, 0, len(s.providers))
+	for _, p := range s.providers {
+		if p != nil {
+			out = append(out, p.Name())
+		}
+	}
+	return out
+}
+
+// MultiSearch 并发调用所有 providers，去重排序后返回统一的 Place 列表。
+func (s *ResearchService) MultiSearch(ctx context.Context, query string, limitPerProvider int) []model.Place {
+	return provider.SearchAll(ctx, query, s.providers, &provider.Options{LimitPerProvider: limitPerProvider})
+}
+
 // TravelResearch 旅游攻略专用的深度研究接口：返回主景点信息 + 按类别分组的周边 POI + 维基百科 + 天气 + 时区
 func (s *ResearchService) TravelResearch(ctx context.Context, query string) (*model.TravelResult, error) {
-	log.Printf("[travel] query=%q starting", query)
+	log.Printf("[travel] query=%q starting across providers=%v", query, s.Providers())
 
-	places, err := s.nominatim.Search(ctx, query, 3)
-	if err != nil {
-		return nil, fmt.Errorf("nominatim search: %w", err)
-	}
-	if len(places) == 0 {
+	// 第一步：并发调用所有 provider 搜索，并去重排序
+	candidates := provider.SearchAll(ctx, query, s.providers, &provider.Options{LimitPerProvider: 3})
+	if len(candidates) == 0 {
 		return &model.TravelResult{Query: query}, nil
 	}
 
-	best := places[0]
-	for _, p := range places {
+	// 第二步：选"最佳"候选
+	best := candidates[0]
+	for _, p := range candidates {
 		if p.Importance > best.Importance {
 			best = p
 		}
 	}
-	log.Printf("[travel] best match: %q (class=%s type=%s)", best.DisplayName, best.Class, best.Type)
+	log.Printf("[travel] best match: %q (source=%s, class=%s, type=%s, lat=%s, lon=%s)",
+		best.DisplayName, best.Source, best.Class, best.Type, best.Lat, best.Lon)
 
 	lat, _ := strconv.ParseFloat(best.Lat, 64)
 	lon, _ := strconv.ParseFloat(best.Lon, 64)
@@ -141,12 +178,22 @@ func (s *ResearchService) DeepResearch(ctx context.Context, query string) (*mode
 	}, nil
 }
 
-// SearchOnly 只调用 Nominatim，返回候选地点列表
+// SearchOnly 调用一个 provider（默认第一个，通常是 nominatim）。
+// 这是为了向后兼容和在 UI 里做快速搜索场景。
 func (s *ResearchService) SearchOnly(ctx context.Context, query string, limit int) ([]model.Place, error) {
 	if limit <= 0 {
 		limit = 5
 	}
-	return s.nominatim.Search(ctx, query, limit)
+	if len(s.providers) == 0 {
+		return nil, fmt.Errorf("no providers registered")
+	}
+	for _, p := range s.providers {
+		// 优先拿 nominatim
+		if p.Name() == "nominatim" {
+			return p.Search(ctx, query, limit)
+		}
+	}
+	return s.providers[0].Search(ctx, query, limit)
 }
 
 func buildPrimary(p *model.Place) *model.PrimaryPlace {

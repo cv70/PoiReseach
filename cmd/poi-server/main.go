@@ -18,38 +18,42 @@ import (
 
 func main() {
 	addr := flag.String("addr", getEnv("POI_HTTP_ADDR", ":8080"), "HTTP listen address")
-	userAgent := flag.String("ua", getEnv("POI_USER_AGENT", "poi-research/1.0 (local travel research tool)"), "User-Agent for upstream APIs")
+	userAgent := flag.String("ua", getEnv("POI_USER_AGENT", "poi-research/2.0 (+local multi-source travel tool)"), "User-Agent for upstream APIs")
 	flag.Parse()
 
 	svc := service.NewResearchService(*userAgent)
 
 	mux := http.NewServeMux()
 
-	// 健康检查
 	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, http.StatusOK, map[string]string{"status": "ok", "time": time.Now().Format(time.RFC3339)})
-	})
-
-	// 根路径：接口说明
-	mux.HandleFunc("GET /", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{
-			"endpoints": map[string]string{
-				"GET /health":                              "健康检查",
-				"GET /api/search?q=NAME&limit=5":           "只调用 Nominatim 返回候选地点",
-				"GET /api/research?q=NAME":                 "深度研究（旧扁平结构）",
-				"GET /api/travel?q=NAME":                   "旅游攻略（推荐）— 景点详情 + 分类周边 + 维基百科 + 天气 + 小贴士",
-			},
-			"examples": []string{
-				"/api/travel?q=Eiffel%20Tower",
-				"/api/travel?q=故宫",
-				"/api/travel?q=Kyoto%20Fushimi%20Inari",
-				"/api/search?q=Times%20Square&limit=3",
-			},
-			"notes": "所有数据实时聚合自 Nominatim / Overpass / Wikipedia / Open-Meteo 等开源 API，不做本地存储。注意各上游有速率限制。",
+			"status":    "ok",
+			"providers": svc.Providers(),
+			"time":      time.Now().Format(time.RFC3339),
 		})
 	})
 
-	// 仅搜索（Nominatim）
+	mux.HandleFunc("GET /", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"name":        "POI Multi-Source Travel Research",
+			"version":     "2.0",
+			"data_sources": svc.Providers(),
+			"endpoints": map[string]string{
+				"GET /health":                         "健康检查 + 当前 provider 列表",
+				"GET /api/search?q=NAME&limit=5":      "单源快速搜索（默认使用 Nominatim）",
+				"GET /api/search/multi?q=NAME&limit=3": "多源并发搜索（Nominatim + Photon + Wikidata）",
+				"GET /api/travel?q=NAME":              "旅游攻略：景点详情 + 分类周边 + 维基百科 + 天气 + 小贴士",
+				"GET /api/research?q=NAME":            "旧版扁平结构，与老客户端兼容",
+			},
+			"examples": []string{
+				"/api/travel?q=Eiffel+Tower",
+				"/api/travel?q=故宫",
+				"/api/travel?q=Kyoto+Fushimi+Inari",
+				"/api/search/multi?q=Times+Square&limit=3",
+			},
+		})
+	})
+
 	mux.HandleFunc("GET /api/search", func(w http.ResponseWriter, r *http.Request) {
 		q := strings.TrimSpace(r.URL.Query().Get("q"))
 		if q == "" {
@@ -69,20 +73,42 @@ func main() {
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]any{
-			"query":  q,
-			"count":  len(result),
-			"places": result,
+			"query":   q,
+			"count":   len(result),
+			"source":  "nominatim (single)",
+			"results": result,
 		})
 	})
 
-	// 深度研究（旧接口，保持兼容）
+	mux.HandleFunc("GET /api/search/multi", func(w http.ResponseWriter, r *http.Request) {
+		q := strings.TrimSpace(r.URL.Query().Get("q"))
+		if q == "" {
+			writeError(w, http.StatusBadRequest, "query parameter 'q' is required")
+			return
+		}
+		limitPerSource := 3
+		if raw := r.URL.Query().Get("limit"); raw != "" {
+			if n, err := strconv.Atoi(raw); err == nil && n > 0 {
+				limitPerSource = n
+			}
+		}
+
+		result := svc.MultiSearch(r.Context(), q, limitPerSource)
+		writeJSON(w, http.StatusOK, map[string]any{
+			"query":        q,
+			"count":        len(result),
+			"data_sources": svc.Providers(),
+			"results":      result,
+		})
+	})
+
 	mux.HandleFunc("GET /api/research", func(w http.ResponseWriter, r *http.Request) {
 		q := strings.TrimSpace(r.URL.Query().Get("q"))
 		if q == "" {
 			writeError(w, http.StatusBadRequest, "query parameter 'q' is required")
 			return
 		}
-		ctx, cancel := context.WithTimeout(r.Context(), 120*time.Second)
+		ctx, cancel := context.WithTimeout(r.Context(), 180*time.Second)
 		defer cancel()
 
 		result, err := svc.DeepResearch(ctx, q)
@@ -94,14 +120,13 @@ func main() {
 		writeJSON(w, http.StatusOK, result)
 	})
 
-	// 旅游攻略（新接口，推荐）
 	mux.HandleFunc("GET /api/travel", func(w http.ResponseWriter, r *http.Request) {
 		q := strings.TrimSpace(r.URL.Query().Get("q"))
 		if q == "" {
-			writeError(w, http.StatusBadRequest, "query parameter 'q' is required. Example: /api/travel?q=Eiffel%20Tower")
+			writeError(w, http.StatusBadRequest, "query parameter 'q' is required. Example: /api/travel?q=Eiffel+Tower")
 			return
 		}
-		ctx, cancel := context.WithTimeout(r.Context(), 180*time.Second)
+		ctx, cancel := context.WithTimeout(r.Context(), 240*time.Second)
 		defer cancel()
 
 		result, err := svc.TravelResearch(ctx, q)
@@ -110,21 +135,24 @@ func main() {
 			writeError(w, http.StatusInternalServerError, err.Error())
 			return
 		}
-		writeJSON(w, http.StatusOK, result)
+		writeJSON(w, http.StatusOK, map[string]any{
+			"query":        q,
+			"data_sources": svc.Providers(),
+			"result":       result,
+		})
 	})
 
-	// CORS（对浏览器更友好）
 	handler := withCORS(withLogging(mux))
 
 	server := &http.Server{
 		Addr:         *addr,
 		Handler:      handler,
 		ReadTimeout:  30 * time.Second,
-		WriteTimeout: 240 * time.Second,
+		WriteTimeout: 300 * time.Second,
 	}
 
 	go func() {
-		log.Printf("POI travel research service listening on http://%s", *addr)
+		log.Printf("POI travel research v2 listening on http://%s (providers=%v)", *addr, svc.Providers())
 		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Fatalf("http server error: %v", err)
 		}
@@ -135,7 +163,7 @@ func main() {
 	<-stop
 	log.Println("shutdown signal received, draining requests...")
 
-	sdCtx, sdCancel := context.WithTimeout(context.Background(), 15*time.Second)
+	sdCtx, sdCancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer sdCancel()
 	if err := server.Shutdown(sdCtx); err != nil {
 		log.Printf("shutdown error: %v", err)
