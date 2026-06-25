@@ -2,6 +2,11 @@ package redfox
 
 import (
 	"context"
+	"crypto/md5"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"sync"
 	"time"
 )
 
@@ -49,19 +54,22 @@ type searchArticleRawItem struct {
 	CollectNum   int64 `json:"collect_num,omitempty"`
 	ForwardCount int64 `json:"forward_count,omitempty"`
 	DiggCount    int64 `json:"digg_count,omitempty"`
-
-	Total int `json:"total,omitempty"`
 }
 
 type searchArticleRawResp struct {
-	List   []searchArticleRawItem `json:"list"`
-	Items  []searchArticleRawItem `json:"items"`
-	Total  int                    `json:"total"`
-	Offset int                    `json:"offset"`
-	HasMore *bool                 `json:"has_more,omitempty"`
+	List    []searchArticleRawItem `json:"list"`
+	Items   []searchArticleRawItem `json:"items"`
+	Total   int                    `json:"total"`
+	Offset  int                    `json:"offset"`
+	HasMore *bool                  `json:"has_more,omitempty"`
 }
 
-func (c *Client) SearchWeChatArticle(ctx context.Context, keyword string, offset int, sortType SortType) (*SearchArticleResult, error) {
+type articleConverter func(searchArticleRawItem) Article
+
+func (c *Client) searchArticle(ctx context.Context, path string, keyword string, offset int, sortType SortType, conv articleConverter) (*SearchArticleResult, error) {
+	if keyword == "" {
+		return nil, fmt.Errorf("keyword is required")
+	}
 	if sortType == "" {
 		sortType = SortByHot
 	}
@@ -70,8 +78,14 @@ func (c *Client) SearchWeChatArticle(ctx context.Context, keyword string, offset
 		Offset:   offset,
 		SortType: string(sortType),
 	}
+
+	cacheKey := fmt.Sprintf("%s:%s:%d:%s", path, keyword, offset, sortType)
+	if cached, ok := c.getCache(cacheKey); ok {
+		return cached, nil
+	}
+
 	var raw searchArticleRawResp
-	if err := c.post(ctx, "/gzhData/searchArticle", req, &raw); err != nil {
+	if err := c.post(ctx, path, req, &raw); err != nil {
 		return nil, err
 	}
 	items := raw.List
@@ -89,9 +103,15 @@ func (c *Client) SearchWeChatArticle(ctx context.Context, keyword string, offset
 		result.HasMore = len(items) > 0 && raw.Total > offset+len(items)
 	}
 	for _, item := range items {
-		result.Items = append(result.Items, convertWeChatArticle(item))
+		result.Items = append(result.Items, conv(item))
 	}
+
+	c.setCache(cacheKey, result)
 	return result, nil
+}
+
+func (c *Client) SearchWeChatArticle(ctx context.Context, keyword string, offset int, sortType SortType) (*SearchArticleResult, error) {
+	return c.searchArticle(ctx, "/gzhData/searchArticle", keyword, offset, sortType, convertWeChatArticle)
 }
 
 func convertWeChatArticle(r searchArticleRawItem) Article {
@@ -118,36 +138,7 @@ func convertWeChatArticle(r searchArticleRawItem) Article {
 }
 
 func (c *Client) SearchDouyinArticle(ctx context.Context, keyword string, offset int, sortType SortType) (*SearchArticleResult, error) {
-	if sortType == "" {
-		sortType = SortByHot
-	}
-	req := searchArticleReq{
-		Keyword:  keyword,
-		Offset:   offset,
-		SortType: string(sortType),
-	}
-	var raw searchArticleRawResp
-	if err := c.post(ctx, "/dyData/searchArticle", req, &raw); err != nil {
-		return nil, err
-	}
-	items := raw.List
-	if len(items) == 0 {
-		items = raw.Items
-	}
-	result := &SearchArticleResult{
-		Total:  raw.Total,
-		Offset: raw.Offset,
-		Items:  make([]Article, 0, len(items)),
-	}
-	if raw.HasMore != nil {
-		result.HasMore = *raw.HasMore
-	} else {
-		result.HasMore = len(items) > 0 && raw.Total > offset+len(items)
-	}
-	for _, item := range items {
-		result.Items = append(result.Items, convertDouyinArticle(item))
-	}
-	return result, nil
+	return c.searchArticle(ctx, "/dyData/searchArticle", keyword, offset, sortType, convertDouyinArticle)
 }
 
 func convertDouyinArticle(r searchArticleRawItem) Article {
@@ -174,36 +165,7 @@ func convertDouyinArticle(r searchArticleRawItem) Article {
 }
 
 func (c *Client) SearchXiaohongshuArticle(ctx context.Context, keyword string, offset int, sortType SortType) (*SearchArticleResult, error) {
-	if sortType == "" {
-		sortType = SortByHot
-	}
-	req := searchArticleReq{
-		Keyword:  keyword,
-		Offset:   offset,
-		SortType: string(sortType),
-	}
-	var raw searchArticleRawResp
-	if err := c.post(ctx, "/xhsUser/searchArticle", req, &raw); err != nil {
-		return nil, err
-	}
-	items := raw.List
-	if len(items) == 0 {
-		items = raw.Items
-	}
-	result := &SearchArticleResult{
-		Total:  raw.Total,
-		Offset: raw.Offset,
-		Items:  make([]Article, 0, len(items)),
-	}
-	if raw.HasMore != nil {
-		result.HasMore = *raw.HasMore
-	} else {
-		result.HasMore = len(items) > 0 && raw.Total > offset+len(items)
-	}
-	for _, item := range items {
-		result.Items = append(result.Items, convertXiaohongshuArticle(item))
-	}
-	return result, nil
+	return c.searchArticle(ctx, "/xhsUser/searchArticle", keyword, offset, sortType, convertXiaohongshuArticle)
 }
 
 func convertXiaohongshuArticle(r searchArticleRawItem) Article {
@@ -271,4 +233,68 @@ func firstNonZero(nums ...int64) int64 {
 		}
 	}
 	return 0
+}
+
+type cacheEntry struct {
+	value     *SearchArticleResult
+	expiresAt time.Time
+}
+
+var (
+	cacheMu    sync.RWMutex
+	cacheStore = make(map[string]cacheEntry)
+	cacheTTL   = 5 * time.Minute
+)
+
+func (c *Client) getCache(key string) (*SearchArticleResult, bool) {
+	cacheMu.RLock()
+	defer cacheMu.RUnlock()
+	entry, ok := cacheStore[cacheHash(key)]
+	if !ok {
+		return nil, false
+	}
+	if time.Now().After(entry.expiresAt) {
+		return nil, false
+	}
+	return entry.value, true
+}
+
+func (c *Client) setCache(key string, value *SearchArticleResult) {
+	cacheMu.Lock()
+	defer cacheMu.Unlock()
+	cacheStore[cacheHash(key)] = cacheEntry{
+		value:     value,
+		expiresAt: time.Now().Add(cacheTTL),
+	}
+}
+
+func cacheHash(key string) string {
+	h := md5.Sum([]byte(key))
+	return hex.EncodeToString(h[:])
+}
+
+func SetCacheTTL(ttl time.Duration) {
+	if ttl > 0 {
+		cacheMu.Lock()
+		cacheTTL = ttl
+		cacheMu.Unlock()
+	}
+}
+
+func ClearCache() {
+	cacheMu.Lock()
+	cacheStore = make(map[string]cacheEntry)
+	cacheMu.Unlock()
+}
+
+func CacheStats() (count int) {
+	cacheMu.RLock()
+	count = len(cacheStore)
+	cacheMu.RUnlock()
+	return
+}
+
+func marshalSize(v any) int {
+	b, _ := json.Marshal(v)
+	return len(b)
 }
